@@ -35,7 +35,7 @@ type ChildProcessWithEvents = ChildProcess & {
 };
 
 export const runningProcesses = new Map<string, RunningProcess>();
-export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+export const MAX_CAPTURE_BYTES = 256 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
@@ -1081,7 +1081,30 @@ export async function runChildProcess(
         let timedOut = false;
         let stdout = "";
         let stderr = "";
-        let logChain: Promise<void> = Promise.resolve();
+
+        // Use a queue instead of a promise chain to prevent unbounded closure
+        // accumulation. The old pattern `logChain = logChain.then(...)` created
+        // an ever-growing linked list of promises, each capturing its chunk
+        // string via closure. When onLog (file I/O) was slower than the data
+        // rate, the chain kept all pending chunks in memory indefinitely.
+        const logQueue: Array<{ stream: "stdout" | "stderr"; text: string }> = [];
+        let logDraining = false;
+        async function drainLogQueue() {
+          if (logDraining) return;
+          logDraining = true;
+          try {
+            while (logQueue.length > 0) {
+              const entry = logQueue.shift()!;
+              try {
+                await opts.onLog(entry.stream, entry.text);
+              } catch (err) {
+                onLogError(err, runId, `failed to append ${entry.stream} log chunk`);
+              }
+            }
+          } finally {
+            logDraining = false;
+          }
+        }
 
         const timeout =
           opts.timeoutSec > 0
@@ -1099,17 +1122,15 @@ export async function runChildProcess(
         child.stdout?.on("data", (chunk: unknown) => {
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
-          logChain = logChain
-            .then(() => opts.onLog("stdout", text))
-            .catch((err) => onLogError(err, runId, "failed to append stdout log chunk"));
+          logQueue.push({ stream: "stdout", text });
+          void drainLogQueue();
         });
 
         child.stderr?.on("data", (chunk: unknown) => {
           const text = String(chunk);
           stderr = appendWithCap(stderr, text);
-          logChain = logChain
-            .then(() => opts.onLog("stderr", text))
-            .catch((err) => onLogError(err, runId, "failed to append stderr log chunk"));
+          logQueue.push({ stream: "stderr", text });
+          void drainLogQueue();
         });
 
         const stdin = child.stdin;
@@ -1136,7 +1157,8 @@ export async function runChildProcess(
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
+          // Drain remaining log entries before resolving
+          void drainLogQueue().finally(() => {
             resolve({
               exitCode: code,
               signal,
